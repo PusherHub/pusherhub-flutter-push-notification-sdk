@@ -8,8 +8,6 @@ import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_timezone/flutter_timezone.dart';
-import 'package:geocoding/geocoding.dart';
-import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -33,6 +31,17 @@ void _pusherHubLog(String message) {
 /// writing a usable token to the log.
 String _pusherHubMaskToken(String token) =>
     token.length <= 8 ? '***' : '${token.substring(0, 8)}…';
+
+/// Where a phone is, as [PusherHub.location] hands it over: what
+/// pusher_hub_location.dart reads from GPS, for an app that already uses
+/// location. Any field may be null.
+class PusherHubPlace {
+  final String? state;
+  final String? city;
+  final String? country;
+
+  const PusherHubPlace({this.state, this.city, this.country});
+}
 
 /// One in-app message returned by [PusherHub.fetchInAppMessages] — a banner,
 /// modal, fullscreen, center-popup, or bottom-sheet message the backend
@@ -124,9 +133,11 @@ class InAppMessage {
 ///   notification permission.
 /// - [collectDeviceMetadata] is optional. Call it separately if you want
 ///   the device's brand/model/app version/language/country/timezone
-///   recorded. GPS-based state/city is off by default — pass
-///   `resolveLocation: true` to turn it on, which is the only thing that
-///   prompts for a location permission.
+///   recorded. State and city come from the device's IP address; an app
+///   that already uses location can add pusher_hub_location.dart and pass
+///   it as [location] for GPS-accurate ones. The SDK never asks for a
+///   location permission, and this file has no location code at all, so
+///   an app without location needs no location permission or text.
 /// - In-app messaging ([fetchInAppMessages] plus the tracking methods) is a
 ///   third, entirely optional tier — an app that never calls it behaves
 ///   exactly as if it didn't exist. Wrap your app in [PusherHubMessageHost] to
@@ -165,6 +176,13 @@ class PusherHub {
   /// to use; if your app starts on a splash screen that moves on by itself,
   /// keep the data and open the screen after it.
   final void Function(Map<String, String> data)? onNotificationOpened;
+
+  /// Optional, only for an app that already uses location: where this
+  /// phone is, for GPS-accurate state and city. Pass `pusherHubLocation`
+  /// from pusher_hub_location.dart, which reads the location only when the
+  /// app already has permission and never asks for it. Without it, the
+  /// backend finds state and city from the device's IP address.
+  final Future<PusherHubPlace?> Function()? location;
 
   // What PusherHub itself puts in a push's data next to the Custom Data —
   // left out of what onNotificationOpened gets.
@@ -229,6 +247,7 @@ class PusherHub {
     required this.baseUrl,
     this.onNotificationClick,
     this.onNotificationOpened,
+    this.location,
   });
 
   /// The identity currently registered with the backend for this device —
@@ -371,12 +390,15 @@ class PusherHub {
   /// permission. Safe to call any time after [registerDevice] has
   /// completed; skips quietly if called before that.
   ///
-  /// Location is off by default, and then no location permission is ever
-  /// requested — the backend estimates state from the device's IP address
-  /// instead. Pass [resolveLocation] `true` for GPS-accurate state and city;
-  /// that prompts for a location permission, and a denial only costs the
-  /// location fields.
-  Future<void> collectDeviceMetadata({bool resolveLocation = false}) async {
+  /// No location permission is ever requested: the backend finds state and
+  /// city from the device's IP address. An app that already uses location
+  /// gets GPS-accurate ones by passing [location] to the constructor.
+  /// [resolveLocation] is only kept so older code still compiles: it does
+  /// nothing on its own any more.
+  Future<void> collectDeviceMetadata({
+    @Deprecated('Pass location: pusherHubLocation (pusher_hub_location.dart) to PusherHub() instead.')
+    bool resolveLocation = false,
+  }) async {
     if (_currentToken == null || _currentExternalId == null) {
       _pusherHubLog(
         'Error - collectDeviceMetadata() called before registerDevice() completed.',
@@ -384,7 +406,14 @@ class PusherHub {
       return;
     }
 
-    await _collectDeviceMetadata(resolveLocation);
+    if (resolveLocation && location == null) {
+      _pusherHubLog(
+        'resolveLocation does nothing on its own now — add pusher_hub_location.dart and pass '
+        'location: pusherHubLocation to PusherHub() for GPS-accurate state and city.',
+      );
+    }
+
+    await _collectDeviceMetadata();
     await _registerToken(_currentExternalId!, _currentToken!);
   }
 
@@ -421,10 +450,9 @@ class PusherHub {
   }
 
   /// Gathers device model/brand, app version, language, and timezone from
-  /// the OS (no permissions needed for those), then — only when
-  /// [resolveLocation] is true — state, city, and country via
-  /// [_collectState], which does need a location permission.
-  Future<void> _collectDeviceMetadata(bool resolveLocation) async {
+  /// the OS (no permissions needed for those), then — only for an app that
+  /// passed [location] — state, city, and country from GPS.
+  Future<void> _collectDeviceMetadata() async {
     try {
       if (Platform.isAndroid) {
         final info = await DeviceInfoPlugin().androidInfo;
@@ -448,9 +476,7 @@ class PusherHub {
 
       _timezone = (await FlutterTimezone.getLocalTimezone()).identifier;
 
-      if (resolveLocation) {
-        await _collectState();
-      }
+      await _collectPlace();
 
       _pusherHubLog(
         'Device metadata — brand: $_deviceBrand, model: $_deviceModel, '
@@ -462,58 +488,32 @@ class PusherHub {
     }
   }
 
-  /// Resolves the device's state/province and city via GPS + reverse
-  /// geocoding, using the OS's own free geocoder (Android's Geocoder / iOS's
-  /// CLGeocoder) — no API key needed. Only runs when the app passed
-  /// `resolveLocation: true`. Requires a location permission prompt; if the
-  /// user denies it or location is unavailable, this fails quietly and the
-  /// location fields simply stay unset rather than blocking registration.
-  Future<void> _collectState() async {
+  /// State, city and country from [location], for an app that passed it —
+  /// pusher_hub_location.dart reads them only when the app already has a
+  /// location permission. Fails quietly: the fields just stay unset, and the
+  /// backend falls back to the device's IP address.
+  Future<void> _collectPlace() async {
+    final where = location;
+    if (where == null) return;
+
     try {
-      if (!await Geolocator.isLocationServiceEnabled()) {
-        _pusherHubLog('Location services disabled — skipping state lookup.');
-        return;
-      }
+      final place = await where();
+      if (place == null) return;
 
-      var permission = await Geolocator.checkPermission();
-      if (permission == LocationPermission.denied) {
-        permission = await Geolocator.requestPermission();
-      }
+      _state = place.state;
+      _city = place.city;
 
-      if (permission == LocationPermission.denied ||
-          permission == LocationPermission.deniedForever) {
-        _pusherHubLog('Location permission denied — skipping state lookup.');
-        return;
-      }
-
-      final position = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.low,
-        ),
-      );
-
-      final placemarks = await Geocoding().placemarkFromCoordinates(
-        position.latitude,
-        position.longitude,
-      );
-
-      if (placemarks.isNotEmpty) {
-        final placemark = placemarks.first;
-        _state = placemark.administrativeArea;
-        _city = placemark.locality;
-
-        // Overrides the locale-based guess in _collectDeviceMetadata() with
-        // the real, GPS-derived country. Locale region is just a user-set OS
-        // preference (e.g. many phones default to "English (United States)"
-        // regardless of where they're actually used) — it can be flatly
-        // wrong. A geocoded result from actual coordinates is trustworthy.
-        final geocodedCountry = placemark.country;
-        if (geocodedCountry != null && geocodedCountry.isNotEmpty) {
-          _country = geocodedCountry;
-        }
+      // Overrides the locale-based guess in _collectDeviceMetadata() with
+      // the real, GPS-derived country. Locale region is just a user-set OS
+      // preference (e.g. many phones default to "English (United States)"
+      // regardless of where they're actually used) — it can be flatly
+      // wrong. A geocoded result from actual coordinates is trustworthy.
+      final placeCountry = place.country;
+      if (placeCountry != null && placeCountry.isNotEmpty) {
+        _country = placeCountry;
       }
     } catch (e) {
-      _pusherHubLog('Failed to resolve state via geocoding: $e');
+      _pusherHubLog('Failed to read the location: $e');
     }
   }
 
@@ -1184,12 +1184,25 @@ class _PusherHubMessageHostState extends State<PusherHubMessageHost> with Widget
         top: MediaQuery.of(context).padding.top + 8,
         left: 12,
         right: 12,
-        child: Material(
-          color: Colors.transparent,
-          child: _buildCard(
-            message,
-            onActivate: (link) => closeWith(link: link, asClick: true),
-            onClose: () => closeWith(asClick: false),
+        // No wider than a phone held upright and no taller than about half
+        // the screen, scrolling past that: a landscape screen gets a card,
+        // not a strip, and a tall message never runs off the bottom.
+        child: Center(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              maxWidth: _pusherHubMaxCardWidth,
+              maxHeight: _pusherHubUsableHeight(context) * 0.6,
+            ),
+            child: Material(
+              color: Colors.transparent,
+              child: SingleChildScrollView(
+                child: _buildCard(
+                  message,
+                  onActivate: (link) => closeWith(link: link, asClick: true),
+                  onClose: () => closeWith(asClick: false),
+                ),
+              ),
+            ),
           ),
         ),
       ),
@@ -1208,11 +1221,18 @@ class _PusherHubMessageHostState extends State<PusherHubMessageHost> with Widget
       context: context,
       builder: (context) {
         dismissTimer ??= _startDismissTimer(message, () => Navigator.of(context).pop());
+        // The dialog keeps clear of the screen's edges; past that height the
+        // message scrolls, so a landscape screen never cuts it off.
         return Dialog(
-          child: _buildCard(
-            message,
-            onActivate: (link) => Navigator.of(context).pop({'link': link}),
-            onClose: () => Navigator.of(context).pop(),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: _pusherHubMaxCardWidth),
+            child: SingleChildScrollView(
+              child: _buildCard(
+                message,
+                onActivate: (link) => Navigator.of(context).pop({'link': link}),
+                onClose: () => Navigator.of(context).pop(),
+              ),
+            ),
           ),
         );
       },
@@ -1232,12 +1252,24 @@ class _PusherHubMessageHostState extends State<PusherHubMessageHost> with Widget
 
     final result = await showModalBottomSheet<Map<String, dynamic>?>(
       context: context,
+      // Sized to the message and allowed most of the screen's height, where
+      // a plain sheet stops at about half: a landscape screen cut the
+      // message off. As wide as a phone held upright at most.
+      isScrollControlled: true,
+      constraints: BoxConstraints(
+        maxWidth: _pusherHubMaxCardWidth,
+        maxHeight: _pusherHubUsableHeight(context) * 0.9,
+      ),
       builder: (context) {
         dismissTimer ??= _startDismissTimer(message, () => Navigator.of(context).pop());
-        return _buildCard(
-          message,
-          onActivate: (link) => Navigator.of(context).pop({'link': link}),
-          onClose: () => Navigator.of(context).pop(),
+        return SafeArea(
+          child: SingleChildScrollView(
+            child: _buildCard(
+              message,
+              onActivate: (link) => Navigator.of(context).pop({'link': link}),
+              onClose: () => Navigator.of(context).pop(),
+            ),
+          ),
         );
       },
     );
@@ -1289,6 +1321,20 @@ class _PusherHubMessageHostState extends State<PusherHubMessageHost> with Widget
   Widget build(BuildContext context) => widget.child;
 }
 
+/// The widest a card-style message gets: about a phone held upright, so a
+/// landscape screen or a tablet shows a card rather than a strip across it.
+const double _pusherHubMaxCardWidth = 560;
+
+/// The widest a fullscreen message's text and buttons get.
+const double _pusherHubMaxFullscreenWidth = 640;
+
+/// The height a message may use: the screen less the system bars and the
+/// keyboard, so a message fits a phone held either way up.
+double _pusherHubUsableHeight(BuildContext context) {
+  final media = MediaQuery.of(context);
+  return max(160.0, media.size.height - media.padding.vertical - media.viewInsets.bottom);
+}
+
 Color? _pusherHubParseColor(String? hex) {
   if (hex == null || hex.isEmpty) return null;
   final cleaned = hex.replaceFirst('#', '');
@@ -1326,6 +1372,15 @@ class _MessageCard extends StatelessWidget {
     final bg = _pusherHubParseColor(message.backgroundColor) ?? Theme.of(context).cardColor;
     final fg = _pusherHubParseColor(message.textColor) ?? Theme.of(context).textTheme.bodyMedium?.color;
     final padding = message.padding ?? 16;
+    // A picture never takes more than about half the height the message has,
+    // so in landscape the heading and button stay in view beside it.
+    final maxImageHeight = _pusherHubUsableHeight(context) * (expand ? 0.5 : 0.4);
+
+    final fields = Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: message.contentMode == 'blocks' ? _buildBlocks(fg, maxImageHeight) : _buildSimpleFields(fg, maxImageHeight),
+    );
 
     final content = Container(
       width: double.infinity,
@@ -1337,12 +1392,7 @@ class _MessageCard extends StatelessWidget {
             ? DecorationImage(image: NetworkImage(message.backgroundImage!), fit: BoxFit.cover)
             : null,
       ),
-      child: Column(
-        mainAxisSize: expand ? MainAxisSize.max : MainAxisSize.min,
-        mainAxisAlignment: expand ? MainAxisAlignment.center : MainAxisAlignment.start,
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: message.contentMode == 'blocks' ? _buildBlocks(fg) : _buildSimpleFields(fg),
-      ),
+      child: expand ? _fullscreenBody(fields) : fields,
     );
 
     if (!message.showCloseButton) return content;
@@ -1356,7 +1406,8 @@ class _MessageCard extends StatelessWidget {
           // status bar/notch itself — every other display type already
           // sits below that by virtue of not touching the very top edge.
           top: (expand ? MediaQuery.of(context).padding.top : 0) + 4,
-          right: 4,
+          // ...and in landscape, the notch at the side.
+          right: (expand ? MediaQuery.of(context).padding.right : 0) + 4,
           child: IconButton(
             icon: message.closeIconUrl != null
                 ? Image.network(
@@ -1374,16 +1425,46 @@ class _MessageCard extends StatelessWidget {
     );
   }
 
-  List<Widget> _buildSimpleFields(Color? fg) {
+  /// A fullscreen message's content: centred on the screen, no wider than
+  /// [_pusherHubMaxFullscreenWidth], clear of the notch, and scrolling when
+  /// it's taller than the screen, as it can be in landscape. The background
+  /// still fills the whole screen behind it.
+  Widget _fullscreenBody(Widget fields) {
+    return SafeArea(
+      child: LayoutBuilder(
+        builder: (context, constraints) => SingleChildScrollView(
+          child: ConstrainedBox(
+            // At least the screen's height, so short content still sits in the middle.
+            constraints: BoxConstraints(minHeight: constraints.maxHeight),
+            child: Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: _pusherHubMaxFullscreenWidth),
+                child: fields,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// A message picture: its whole width at its natural shape, as the
+  /// dashboard preview shows it, but shrunk to [maxHeight] when it would be
+  /// taller, rather than pushing the rest of the message off the screen.
+  Widget _picture(String url, double maxHeight) {
+    return ConstrainedBox(
+      constraints: BoxConstraints(maxHeight: maxHeight),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(8),
+        child: Image.network(url, fit: BoxFit.contain, width: double.infinity),
+      ),
+    );
+  }
+
+  List<Widget> _buildSimpleFields(Color? fg, double maxImageHeight) {
     return [
       if (message.image != null) ...[
-        // fitWidth with no fixed height shows the whole image at its
-        // natural aspect ratio (matches the dashboard preview's
-        // <img class="w-full"> — no crop, no letterboxing).
-        ClipRRect(
-          borderRadius: BorderRadius.circular(8),
-          child: Image.network(message.image!, fit: BoxFit.fitWidth, width: double.infinity),
-        ),
+        _picture(message.image!, maxImageHeight),
         const SizedBox(height: 12),
       ],
       if (message.heading != null) ...[
@@ -1413,7 +1494,7 @@ class _MessageCard extends StatelessWidget {
     ];
   }
 
-  List<Widget> _buildBlocks(Color? fg) {
+  List<Widget> _buildBlocks(Color? fg, double maxImageHeight) {
     final widgets = <Widget>[];
 
     for (final block in message.blocks) {
@@ -1451,11 +1532,7 @@ class _MessageCard extends StatelessWidget {
           );
           if (clickAction != null) child = GestureDetector(onTap: handleTap, child: child);
         case 'image':
-          // See _buildSimpleFields' image for why fitWidth + no fixed height.
-          child = ClipRRect(
-            borderRadius: BorderRadius.circular(8),
-            child: Image.network(block['image'] as String? ?? '', fit: BoxFit.fitWidth, width: double.infinity),
-          );
+          child = _picture(block['image'] as String? ?? '', maxImageHeight);
           if (clickAction != null) child = GestureDetector(onTap: handleTap, child: child);
         case 'button':
           child = ElevatedButton(
@@ -1555,6 +1632,7 @@ class _HtmlMessageCardState extends State<_HtmlMessageCard> {
   @override
   Widget build(BuildContext context) {
     if (widget.expand) return WebViewWidget(controller: _controller);
-    return SizedBox(height: 280, child: WebViewWidget(controller: _controller));
+    // 280 high, or less on a screen too short for it, as in landscape.
+    return SizedBox(height: min(280.0, _pusherHubUsableHeight(context) * 0.7), child: WebViewWidget(controller: _controller));
   }
 }

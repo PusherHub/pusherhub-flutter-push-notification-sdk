@@ -10,8 +10,9 @@ Push notifications and in-app messages for your Flutter app on **Android and iOS
 - Links a phone to your own user id with `login()` — remembered across restarts until `logout()`
 - Reports notification opens and clicks for your delivery stats
 - Hands your app each tapped notification's Custom Data, so you can open the right screen
-- Shows in-app messages (banner, modal, full screen, center popup, bottom sheet) on app open
-- Optional device details (brand, model, app version, language, country, time zone), and GPS-accurate state and city if you turn location on
+- Shows in-app messages (banner, modal, full screen, center popup, bottom sheet) on app open, fitted to portrait and landscape screens
+- Optional device details (brand, model, app version, language, country, time zone); state and city come from the phone's IP address
+- No location code and no location permission: an app that already uses location can add the optional `pusher_hub_location.dart` for GPS-accurate state and city
 
 The SDK is a single file, `pusher_hub.dart`.
 
@@ -34,13 +35,11 @@ The SDK is a single file, `pusher_hub.dart`.
      device_info_plus: ^11.1.1
      package_info_plus: ^8.1.2
      flutter_timezone: ^5.1.0
-     geolocator: ^13.0.1
-     geocoding: ^5.0.0
      url_launcher: ^6.3.1
      webview_flutter: ^4.10.0
    ```
 
-   `pusher_hub.dart` needs all of these to compile, even the ones for features you don't use.
+   `pusher_hub.dart` needs all of these to compile, even the ones for features you don't use. None of them uses location.
 
 2. Copy [`pusher_hub.dart`](pusher_hub.dart) into your app's `lib/` folder.
 
@@ -76,7 +75,9 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      // Optional: shows in-app messages on app open and resume.
+      // Shows your in-app messages on app open and resume. Keep it, or
+      // they never appear. It wraps a screen inside MaterialApp: with
+      // routes or a router, wrap the main screen people stay on.
       home: PusherHubMessageHost(
         pusherHub: pusherHub,
         child: const MyHomePage(),
@@ -85,6 +86,25 @@ class MyApp extends StatelessWidget {
   }
 }
 ```
+
+## Location (only if your app already uses it)
+
+PusherHub finds each phone's state and city from its IP address, so most apps skip this. Don't add a location permission just for PusherHub: Google Play and the App Store then ask you to explain why your app uses location.
+
+An app that already asks for location can copy [`pusher_hub_location.dart`](pusher_hub_location.dart) next to `pusher_hub.dart` (it needs `geolocator` and `geocoding`, which such an app usually has) and pass it in:
+
+```dart
+import 'pusher_hub_location.dart';
+
+final pusherHub = PusherHub(
+  appKey: 'YOUR_APP_KEY',
+  publicKey: 'YOUR_PUBLIC_KEY',
+  baseUrl: 'https://pusherhub.com/api',
+  location: pusherHubLocation,
+);
+```
+
+It never asks for location: it reads it only when the person has already allowed it for your app.
 
 ## Signed-in users
 
